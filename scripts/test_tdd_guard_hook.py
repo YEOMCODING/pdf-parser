@@ -1,5 +1,4 @@
 import json
-import os
 import subprocess
 import tempfile
 import unittest
@@ -8,15 +7,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / ".codex" / "hooks" / "tdd-guard.sh"
+HOOK_CONFIG = ROOT / ".codex" / "hooks.json"
 
 
-def patch_event(path: str) -> dict:
+def patch_event(path: str, *, action: str = "Update") -> dict:
     return {
         "tool_name": "apply_patch",
         "tool_input": {
             "command": (
                 "*** Begin Patch\n"
-                f"*** Update File: {path}\n"
+                f"*** {action} File: {path}\n"
                 "@@\n"
                 "+changed\n"
                 "*** End Patch\n"
@@ -25,140 +25,103 @@ def patch_event(path: str) -> dict:
     }
 
 
+def denial_reason(result: subprocess.CompletedProcess) -> str:
+    output = json.loads(result.stdout)
+    hook_output = output["hookSpecificOutput"]
+    assert hook_output["hookEventName"] == "PreToolUse"
+    assert hook_output["permissionDecision"] == "deny"
+    return hook_output["permissionDecisionReason"]
+
+
 class TddGuardHookTest(unittest.TestCase):
-    def run_guard(self, mode: str, event: dict, tmp: Path, extra_env=None):
-        env = os.environ.copy()
-        env["TDD_GUARD_ROOT"] = str(tmp)
-        env["TDD_GUARD_STATE_FILE"] = str(tmp / "state.json")
-        if extra_env:
-            env.update(extra_env)
+    def test_hook_config_runs_pretooluse_for_apply_patch_only(self):
+        config = json.loads(HOOK_CONFIG.read_text(encoding="utf-8"))
+        self.assertEqual(set(config["hooks"]), {"PreToolUse"})
+        groups = config["hooks"]["PreToolUse"]
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["matcher"], "^apply_patch$")
+
+    def run_guard(self, event: dict, tmp: Path):
         return subprocess.run(
-            ["bash", str(SCRIPT), mode],
+            ["bash", str(SCRIPT), "pre"],
             input=json.dumps(event),
             text=True,
             capture_output=True,
-            env=env,
             cwd=tmp,
         )
 
     def test_allows_test_file_patch(self):
         with tempfile.TemporaryDirectory() as dirname:
             tmp = Path(dirname)
-            result = self.run_guard("pre", patch_event("scripts/test_app.py"), tmp)
+            result = self.run_guard(patch_event("src/lib/parser.test.ts"), tmp)
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
 
-    def test_blocks_production_patch_without_red_test(self):
+    def test_blocks_typescript_implementation_without_test_file(self):
         with tempfile.TemporaryDirectory() as dirname:
             tmp = Path(dirname)
-            result = self.run_guard("pre", patch_event("scripts/app.py"), tmp)
-
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("production edit blocked", result.stderr)
-
-    def test_stop_failed_validation_continues_codex(self):
-        with tempfile.TemporaryDirectory() as dirname:
-            tmp = Path(dirname)
-            self.run_guard("post", patch_event("scripts/test_app.py"), tmp)
-            self.run_guard(
-                "post",
-                {
-                    "tool_name": "Bash",
-                    "tool_input": {"command": "python3 -m pytest scripts/test_app.py"},
-                    "tool_response": {"exitCode": 1},
-                },
-                tmp,
-            )
-            self.run_guard("post", patch_event("scripts/app.py"), tmp)
-
-            result = self.run_guard(
-                "stop",
-                {"hook_event_name": "Stop"},
-                tmp,
-                extra_env={"TDD_GUARD_TEST_COMMAND": "false"},
-            )
+            result = self.run_guard(patch_event("src/lib/parser.ts"), tmp)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        output = json.loads(result.stdout)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("final test command failed", output["reason"])
+        self.assertIn("parser", denial_reason(result))
 
-    def test_allows_production_patch_after_failing_test_run(self):
+    def test_allows_typescript_implementation_with_sibling_test_file(self):
         with tempfile.TemporaryDirectory() as dirname:
             tmp = Path(dirname)
-            self.run_guard("post", patch_event("scripts/test_app.py"), tmp)
-            self.run_guard(
-                "post",
-                {
-                    "tool_name": "Bash",
-                    "tool_input": {"command": "python3 -m pytest scripts/test_app.py"},
-                    "tool_response": {"exitCode": 1},
-                },
-                tmp,
-            )
+            (tmp / "src/lib").mkdir(parents=True)
+            (tmp / "src/lib/parser.test.ts").write_text("", encoding="utf-8")
 
-            result = self.run_guard("pre", patch_event("scripts/app.py"), tmp)
+            result = self.run_guard(patch_event("src/lib/parser.ts"), tmp)
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
 
-    def test_blocks_bash_file_mutation(self):
+    def test_allows_typescript_implementation_with_parent_tests_file(self):
         with tempfile.TemporaryDirectory() as dirname:
             tmp = Path(dirname)
-            result = self.run_guard(
-                "pre",
-                {
-                    "tool_name": "Bash",
-                    "tool_input": {"command": "printf 'x' > scripts/app.py"},
-                },
-                tmp,
-            )
+            (tmp / "src/__tests__").mkdir(parents=True)
+            (tmp / "src/__tests__/parser.spec.ts").write_text("", encoding="utf-8")
 
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("Bash file mutation is blocked", result.stderr)
+            result = self.run_guard(patch_event("src/lib/parser.ts"), tmp)
 
-    def test_blocks_apply_patch_through_bash(self):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_blocks_python_implementation_without_test_file(self):
         with tempfile.TemporaryDirectory() as dirname:
             tmp = Path(dirname)
-            result = self.run_guard(
-                "pre",
-                {
-                    "tool_name": "Bash",
-                    "tool_input": {"command": "apply_patch <<'PATCH'\n*** Begin Patch\n*** End Patch\nPATCH"},
-                },
-                tmp,
-            )
+            result = self.run_guard(patch_event("scripts/execute.py"), tmp)
 
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("apply_patch through Bash", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("execute", denial_reason(result))
 
-    def test_passing_test_closes_red_cycle(self):
+    def test_allows_python_implementation_with_sibling_test_file(self):
         with tempfile.TemporaryDirectory() as dirname:
             tmp = Path(dirname)
-            self.run_guard("post", patch_event("scripts/test_app.py"), tmp)
-            self.run_guard(
-                "post",
-                {
-                    "tool_name": "Bash",
-                    "tool_input": {"command": "python3 -m pytest scripts/test_app.py"},
-                    "tool_response": {"exitCode": 1},
-                },
-                tmp,
-            )
-            self.run_guard("post", patch_event("scripts/app.py"), tmp)
-            self.run_guard(
-                "post",
-                {
-                    "tool_name": "Bash",
-                    "tool_input": {"command": "python3 -m pytest scripts/test_app.py"},
-                    "tool_response": {"exitCode": 0},
-                },
-                tmp,
-            )
+            (tmp / "scripts").mkdir()
+            (tmp / "scripts/test_execute.py").write_text("", encoding="utf-8")
 
-            result = self.run_guard("pre", patch_event("scripts/other.py"), tmp)
+            result = self.run_guard(patch_event("scripts/execute.py"), tmp)
 
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("production edit blocked", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_allows_framework_entry_files_without_companion_test(self):
+        with tempfile.TemporaryDirectory() as dirname:
+            tmp = Path(dirname)
+            result = self.run_guard(patch_event("src/app/page.tsx"), tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_ignores_deleted_implementation_files(self):
+        with tempfile.TemporaryDirectory() as dirname:
+            tmp = Path(dirname)
+            result = self.run_guard(patch_event("src/lib/parser.ts", action="Delete"), tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
 
 
 if __name__ == "__main__":

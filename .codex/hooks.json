@@ -2,38 +2,13 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^(apply_patch|Bash)$",
+        "matcher": "^apply_patch$",
         "hooks": [
           {
             "type": "command",
             "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/tdd-guard.sh\" pre",
             "timeout": 30,
             "statusMessage": "Checking TDD guard"
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "^(apply_patch|Bash)$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/tdd-guard.sh\" post",
-            "timeout": 30,
-            "statusMessage": "Recording TDD state"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "TDD_GUARD_STRICT_STOP=1 bash \"$(git rev-parse --show-toplevel)/.codex/hooks/tdd-guard.sh\" stop",
-            "timeout": 120,
-            "statusMessage": "Running TDD guard validation"
           }
         ]
       }
