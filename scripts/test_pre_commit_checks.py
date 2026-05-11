@@ -1,5 +1,4 @@
 import io
-import json
 import subprocess
 import sys
 import unittest
@@ -19,26 +18,23 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(pc)
 
 
-def write_package_json(root: Path, scripts: Dict[str, str]) -> None:
-    (root / "package.json").write_text(
-        json.dumps({"scripts": scripts}, indent=2),
-        encoding="utf-8",
-    )
+def write_pyproject(root: Path, content: str = "[project]\nname = \"demo\"\n") -> None:
+    (root / "pyproject.toml").write_text(content, encoding="utf-8")
 
 
 class FakeRunner:
-    def __init__(self, returncodes=None):
+    def __init__(self, returncodes: Dict[str, int] | None = None):
         self.returncodes = returncodes or {}
         self.calls = []
 
     def __call__(self, cmd, cwd):
         self.calls.append((cmd, cwd))
-        script = cmd[-1]
-        return subprocess.CompletedProcess(cmd, self.returncodes.get(script, 0))
+        key = " ".join(cmd)
+        return subprocess.CompletedProcess(cmd, self.returncodes.get(key, 0))
 
 
 class TestPreCommitChecks(unittest.TestCase):
-    def test_skips_when_package_json_is_missing(self):
+    def test_skips_when_pyproject_is_missing(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             runner = FakeRunner()
@@ -49,32 +45,12 @@ class TestPreCommitChecks(unittest.TestCase):
 
             self.assertEqual(result, 0)
             self.assertEqual(runner.calls, [])
-            self.assertIn("package.json not found", stdout.getvalue())
+            self.assertIn("pyproject.toml not found", stdout.getvalue())
 
-    def test_fails_when_required_scripts_are_missing(self):
+    def test_runs_python_checks_in_order(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write_package_json(root, {"lint": "eslint ."})
-            runner = FakeRunner()
-            stderr = io.StringIO()
-
-            with redirect_stderr(stderr):
-                result = pc.run_checks(root, runner=runner)
-
-            self.assertEqual(result, 1)
-            self.assertEqual(runner.calls, [])
-            output = stderr.getvalue()
-            self.assertIn("Missing required npm scripts", output)
-            self.assertIn("build", output)
-            self.assertIn("test", output)
-
-    def test_runs_lint_build_and_test_in_order(self):
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            write_package_json(
-                root,
-                {"lint": "eslint .", "build": "next build", "test": "vitest"},
-            )
+            write_pyproject(root)
             runner = FakeRunner()
             stdout = io.StringIO()
 
@@ -85,21 +61,31 @@ class TestPreCommitChecks(unittest.TestCase):
             self.assertEqual(
                 [call[0] for call in runner.calls],
                 [
-                    ["npm", "run", "lint"],
-                    ["npm", "run", "build"],
-                    ["npm", "run", "test"],
+                    [sys.executable, "-m", "ruff", "check", "."],
+                    [sys.executable, "-m", "pytest"],
                 ],
             )
             self.assertTrue(all(call[1] == root for call in runner.calls))
 
+    def test_prefers_local_venv_python(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_pyproject(root)
+            venv_python = root / ".venv" / "bin" / "python"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("", encoding="utf-8")
+            runner = FakeRunner()
+
+            result = pc.run_checks(root, runner=runner)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(runner.calls[0][0][0], str(venv_python))
+
     def test_stops_on_first_failed_check(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write_package_json(
-                root,
-                {"lint": "eslint .", "build": "next build", "test": "vitest"},
-            )
-            runner = FakeRunner(returncodes={"build": 2})
+            write_pyproject(root)
+            runner = FakeRunner(returncodes={f"{sys.executable} -m ruff check .": 2})
             stdout = io.StringIO()
             stderr = io.StringIO()
 
@@ -109,25 +95,9 @@ class TestPreCommitChecks(unittest.TestCase):
             self.assertEqual(result, 2)
             self.assertEqual(
                 [call[0] for call in runner.calls],
-                [
-                    ["npm", "run", "lint"],
-                    ["npm", "run", "build"],
-                ],
+                [[sys.executable, "-m", "ruff", "check", "."]],
             )
-
-    def test_invalid_package_json_fails(self):
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "package.json").write_text("{ invalid", encoding="utf-8")
-            runner = FakeRunner()
-            stderr = io.StringIO()
-
-            with redirect_stderr(stderr):
-                result = pc.run_checks(root, runner=runner)
-
-            self.assertEqual(result, 1)
-            self.assertEqual(runner.calls, [])
-            self.assertIn("Invalid package.json", stderr.getvalue())
+            self.assertIn("ruff check failed", stderr.getvalue())
 
 
 if __name__ == "__main__":

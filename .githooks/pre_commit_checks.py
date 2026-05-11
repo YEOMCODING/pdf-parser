@@ -1,56 +1,37 @@
 #!/usr/bin/env python3
-import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
 
 
-CHECKS = ("lint", "build", "test")
-
-
-def load_package(root: Path) -> Optional[dict]:
-    package_file = root / "package.json"
-    if not package_file.exists():
-        return None
-
-    try:
-        return json.loads(package_file.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid package.json: {exc}") from exc
+CHECKS = (
+    ("ruff check", ["-m", "ruff", "check", "."]),
+    ("pytest", ["-m", "pytest"]),
+)
 
 
 def run_checks(root: Path, runner=subprocess.run) -> int:
-    try:
-        package = load_package(root)
-    except ValueError as exc:
-        print(exc, file=sys.stderr)
-        return 1
-
-    if package is None:
-        print("package.json not found; skipping npm lint/build/test checks.")
+    pyproject = root / "pyproject.toml"
+    if not pyproject.exists():
+        print("pyproject.toml not found; skipping Python lint/test checks.")
         return 0
 
-    scripts = package.get("scripts")
-    if not isinstance(scripts, dict):
-        scripts = {}
-
-    missing = [name for name in CHECKS if name not in scripts]
-    if missing:
-        print(
-            "Missing required npm scripts: " + ", ".join(missing),
-            file=sys.stderr,
-        )
-        return 1
-
-    for name in CHECKS:
-        print(f"Running npm run {name}")
-        result = runner(["npm", "run", name], cwd=root)
+    python = python_executable(root)
+    for label, command in CHECKS:
+        print(f"Running {label}")
+        result = runner([python, *command], cwd=root)
         if result.returncode != 0:
-            print(f"npm run {name} failed with exit code {result.returncode}", file=sys.stderr)
+            print(f"{label} failed with exit code {result.returncode}", file=sys.stderr)
             return result.returncode
 
     return 0
+
+
+def python_executable(root: Path) -> str:
+    venv_python = root / ".venv" / "bin" / "python"
+    if venv_python.exists():
+        return str(venv_python)
+    return sys.executable
 
 
 def main() -> int:
